@@ -1,11 +1,11 @@
 import logging
 from enum import IntEnum
 
+from pygbx.lzo import LZO
 import zlib
 
 import pygbx.headers as headers
 from pygbx.bytereader import ByteReader
-from pygbx.lzo import LZO
 
 
 class GbxType(IntEnum):
@@ -93,6 +93,8 @@ class Gbx(object):
         self.__current_waypoint = None
         self.__replay_header_info = {}
 
+        self.lzo = LZO()
+
         self.root_parser.skip(3)
         if self.version >= 4:
             self.root_parser.skip(1)
@@ -130,11 +132,13 @@ class Gbx(object):
         self.root_parser.push_position_checkpoint()
         self.positions['data_size'] = self.root_parser.pop_position_checkpoint()
 
-        uncompressed_data_size = self.root_parser.read_uint32()
-        compressed_data_size = self.root_parser.read_uint32()
-        cdata = self.root_parser.read(compressed_data_size)
-        lzo = LZO()
-        self.data = bytearray(lzo.lzo1x_decompress_safe(cdata, uncompressed_data_size))
+        uncompressed_size = self.root_parser.read_uint32()
+        compressed_size = self.root_parser.read_uint32()
+        compressed_data = self.root_parser.read(compressed_size)
+        self.data = self.lzo.decompress(compressed_data, uncompressed_size)
+
+        if not self.data:
+            raise GbxLoadError(f'data decompression has failed')
 
         bp = ByteReader(self.data)
         self._read_node(self.class_id, -1, bp)
@@ -408,8 +412,8 @@ class Gbx(object):
                 # m = hashlib.md5()
                 # m.update(bp.read(16))
                 # if isinstance(self.__current_class, headers.CGameChallenge):
-                # self.__current_class.password_hash = m.hexdigest()
-                # self.__current_class.password_crc = bp.read_uint32()
+                    # self.__current_class.password_hash = m.hexdigest()
+                    # self.__current_class.password_crc = bp.read_uint32()
             elif cid == 0x03043017:
                 num_cps = bp.read_uint32()
                 for _ in range(num_cps):

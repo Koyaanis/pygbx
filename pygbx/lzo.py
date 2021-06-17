@@ -1,366 +1,160 @@
-import logging
-from os import path, name as osname, getcwd
+import ctypes
+from os import path, name as osname
+from ctypes import CDLL, c_uint32, byref, c_char_p, POINTER, sizeof, c_void_p
+from logging import error
 
 
-class LZO(object):
+class LZO:
+    """This class contains stand alone methods of the LZO library. It calls an external library file and will run in C.
+
+    Usage
+        Create an instance of this class and use it with obj.decompress(data, uncompressed_size) or obj.compress(data).
+        It will always return data or False on failure. The instance is reusable.
+
+    Availability
+        This library should work on Windows and Linux both 32 and 64 bit. If you encounter issues
+        please submit an issue
+
+    Extra info
+        When decompressing, the uncompressed_size argument is known before the data is uncompressed.
+        It is written inside of GBX data and has to be retrieved from there.
+
+        Internal LZO functions that are used
+            lzo1x_999_compress
+            lzo1x_decompress_safe
+
+        Other internal functions that are called from the above
+            lzo1x_999_compress_internal
+            lzo1x_999_compress_level
+
+        lzo1x_999_compress
+            This is the best function for compressing data in terms of file size, but also one of the slowest. The LZO
+            FAQ itself says however it should be used when generating pre-compressed data (meaning stuff like
+            Replay/Challenge files). The decompression speed is not affected by whatever compression function was used.
+
+        lzo1x_decompress_safe
+            Extremely fast decompression algorithm. It was designed for run time applications, such as it was in the
+            game Trackmania. Its name has the postfix _safe because it can never crash (from LZO FAQ). However there is
+            no guarantee that the returned data has its integrity preserved. LZO offers crc32 (and adler32) to check the
+            integrity, but since GBX data doesn't seem to have the checksum written anywhere, there was also no real
+            point of integrating the lzo_crc32 into this library. If you know where the checksum might be hidden please
+            write us back.
+
+        Speed
+            The lzo1x_decompress_safe function is extremely fast. Benchmarking 100,000 iterations of decompressing a
+            TMNF replay file (36538 bytes in size) took approximately 1.08 seconds. The uncompressed size was 38595
+
+            The lzo1x_999_compress function is slow. Benchmarking 1000 iterations of uncompressed data from above with
+            a size of 38595 bytes took approximately 2.7 seconds (which still is only ~0.003 seconds for a GBX Replay)
+
+        Comparison to compression of TMNF
+            A random set of 14000 replays were analyzed in terms of their compressed to decompressed ratio for the
+            internal function the game uses vs the lzo1x_999_compress function this library uses.
+            On average, the compression factor of replay files in TMNF are at about 94.33%, where as compressing that
+            data with lzo1x_999_compress resulted in a compression rate of about 93.60%.
+
+            Tip: You can if you want uncompress the data in your GBX data and re-compress it with this
+            lzo1x_999_compress method to save a little bit of space, it is recognized and acceptable by the game
+    """
+
     def __init__(self):
-        # Force this variable until non lib version is ready
-        use_shared_lib = True
-        self._use_shared_lib = use_shared_lib
-        # Load libs here once in case someone wants to execute the compression methods in batch mode
-        if self._use_shared_lib:
-            import ctypes
-            self._lib_ext = ''
-            if osname == 'nt':
-                self._lib_ext = '.dll'
-            elif osname == 'posix':
-                self._lib_ext = '.so'
-            else:
-                self._lib_ext = False
-            if self._lib_ext:
-                self._decompress_lib_path = path.join(getcwd(), 'pygbx', 'lzo', 'libs',
-                                                      f'lzo1x_decompress_safe{self._lib_ext}')
-                self._lzo_lib = ctypes.CDLL(self._decompress_lib_path)
-            else:
-                logging.error(f'your system cannot load the lzo libs. required: windows/posix, given: {osname}')
+        """Loads library upon object creation once"""
 
-    def lzo1x_decompress_safe(self, data, uncompressed_size):
-        if self._use_shared_lib:
-            return self._lzo1x_decompress_safe_libs(data, uncompressed_size)
+        # Check for architecture size
+        self.is64 = sizeof(c_void_p) >> 3
+
+        # Check for architecture (Windows/Linux supported)
+        if osname == 'nt':
+            self.__lib_ext = '.dll'
+        elif osname == 'posix':
+            self.__lib_ext = '.so'
         else:
-            return self._lzo1x_decompress_safe(data, uncompressed_size)
+            raise Exception(f'Your system cannot load the LZO libs. Required: Windows/Linux, given: {osname}')
 
-    def _lzo1x_decompress_safe_libs(self, data, uncompressed_size):
-        if not self._lib_ext:
-            logging.error(f'your system cannot load the lzo libs. required: windows/posix, given: {osname}')
-            return False
+        self.__lzo1x_lib_path = path.join(path.dirname(path.abspath(__file__)), 'lzo', 'libs',
+                                          f'lzo1x_{"64" if self.is64 else "32"}{self.__lib_ext}')
+
+        try:
+            self.__lzo1x_lib = CDLL(self.__lzo1x_lib_path)
+        except Exception as e:
+            raise Exception(f'LZO library could not be loaded: {e}')
+
+        # Specify arguments and response types
+        self.__lzo1x_lib.lzo1x_decompress_safe.restype = c_uint32
+        self.__lzo1x_lib.lzo1x_decompress_safe.argtypes = [c_char_p, c_uint32, c_char_p,
+                                                           POINTER(c_uint32)]
+
+        self.__lzo1x_lib.lzo1x_999_compress.restype = c_uint32
+        self.__lzo1x_lib.lzo1x_999_compress.argtypes = [c_char_p, c_uint32, c_char_p,
+                                                        POINTER(c_uint32), ctypes.c_void_p]
+
+    def decompress(self, data, uncompressed_size):
+        return self.__lzo1x_decompress_safe(data, uncompressed_size)
+
+    def compress(self, data):
+        return self.__lzo1x_999_compress(data)
+
+    def __lzo1x_decompress_safe(self, data, uncompressed_size):
         if not isinstance(data, bytes):
             try:
                 data = bytes(data)
             except Exception as e:
-                logging.error(f'Could not turn data into bytes data type: {e}')
+                error(f'Could not turn data into type bytes: {e}')
                 return False
         if not isinstance(uncompressed_size, int):
-            logging.error(f'uncompressed_size must be of data type int. {type(uncompressed_size)} was given')
+            error(f'uncompressed_size must be of data type int. {type(uncompressed_size)} was given')
             return False
 
-        self.out = bytes(uncompressed_size)
-        compressed_size = len(data)
+        # decompressed data goes here
+        out_buffer = bytes(uncompressed_size)
+
+        # C unsigned int compressed_size
+        compressed_size = c_uint32(len(data))
+
+        # Pointer to uncompressed_size. The function takes in a pointer to uncompressed_size and uses it internally
+        # to store some internal temporary value which then holds the uncompressed_size and is used for something else.
+        # Afterwards the internal function sets our outside uncompressed_size to 0, and as the decompression process
+        # progresses, it writes into it the number of bytes that were written (hence the name bytes_written for the
+        # pointer). After the internal function returns, it will have set our outside uncompressed_size to the bytes
+        # that were actually written, so uncompressed_size should become the same value again, if no error has occurred
+        bytes_written = c_uint32(uncompressed_size)
+
         try:
-            self._lzo_lib.lzo1x_decompress_safe(data, compressed_size, self.out, uncompressed_size)
-            return self.out
+            if self.__lzo1x_lib.lzo1x_decompress_safe(data, compressed_size, out_buffer, byref(bytes_written)):
+                return False
+
+            # check if the bytes that were written match out_buffer size we have originally allocated
+            if bytes_written.value != len(out_buffer):
+                return False
+            else:
+                return out_buffer
         except Exception as e:
-            print('?')
-            logging.error(e)
+            error(e)
             return False
 
-    def _lzo1x_decompress_safe(self, data, uncompressed_size):
-        pass
-        # TODO: Create a python code version of this
+    def __lzo1x_999_compress(self, data):
+        if not isinstance(data, bytes):
+            try:
+                data = bytes(data)
+            except Exception as e:
+                error(f'Could not turn data into bytes data type: {e}')
+                return False
 
+        # Compressed data ends up here. According to LZO FAQ, the size of this buffer is calculated with this formula:
+        # out_size = in_size + (in_size / 16) + 64 + 3
+        # These are worst case scenario expansions (~106% of in_size)
+        out_buffer = bytes(len(data) + (int(len(data) / 16)) + 67)
 
-"""
-int __cdecl lzo1x_decompress_safe(const unsigned char* in, unsigned long in_len,
-    unsigned char* out, unsigned long* out_len) {
-    unsigned char* op;
-    const unsigned char* ip;
-    unsigned long t;
-    const unsigned char* m_pos;
+        work_memory = bytes(524288)
+        uncompressed_size = c_uint32(len(data))
+        bytes_written = c_uint32(0)
 
-    const unsigned char* const ip_end = in + in_len;
-    unsigned char* const op_end = out + *out_len;
+        try:
+            if self.__lzo1x_lib.lzo1x_999_compress(
+                    data, uncompressed_size, out_buffer, byref(bytes_written), work_memory) != 0:
+                return False
 
-    bool needs_first_literal_run = false;
-    bool needs_match_done = false;
-    bool needs_match = false;
-
-    *out_len = 0;
-
-    op = out;
-    ip = in;
-
-    if (*ip > 17)
-    {
-        t = *ip++ - 17;
-        if (t < 4) {
-            if ((unsigned long)(op_end - op) < (unsigned long)(t)) {
-                *out_len = op - out;
-                return -5;
-            }
-
-            if ((unsigned long)(ip_end - ip) < (unsigned long)(t + 1)) {
-                *out_len = op - out;
-                return -4;
-            }
-
-            *op++ = *ip++;
-
-            if (t > 1) {
-                *op++ = *ip++;
-                if (t > 2) {
-                    *op++ = *ip++;
-                }
-            }
-
-            t = *ip++;
-
-            if (ip >= ip_end) {
-                *out_len = op - out;
-                return -7;
-            }
-        }
-        else {
-            if ((unsigned long)(op_end - op) < (unsigned long)(t)) {
-                *out_len = op - out;
-                return -5;
-            }
-            if ((unsigned long)(ip_end - ip) < (unsigned long)(t + 1)) {
-                *out_len = op - out; return -4;
-            }
-            do *op++ = *ip++; while (--t > 0);
-            needs_first_literal_run = true;
-        }
-    }
-
-    while (ip < ip_end || needs_first_literal_run)
-    {
-        if (needs_match == false) {
-            if (needs_first_literal_run == false) {
-                t = *ip++;
-                if (t >= 16) {
-                    needs_match = true;
-                    continue;
-                }
-                if (t == 0)
-                {
-                    if ((unsigned long)(ip_end - ip) < (unsigned long)(1)) {
-                        *out_len = op - out;
-                        return -4;
-                    }
-                    while (*ip == 0)
-                    {
-                        t += 255;
-                        ip++;
-                        if ((unsigned long)(ip_end - ip) < (unsigned long)(1)) {
-                            *out_len = op - out;
-                            return -4;
-                        }
-                    }
-                    t += 15 + *ip++;
-                }
-                if ((unsigned long)(op_end - op) < (unsigned long)(t + 3)) {
-                    *out_len = op - out;
-                    return -5;
-                }
-                if ((unsigned long)(ip_end - ip) < (unsigned long)(t + 4)) {
-                    *out_len = op - out;
-                    return -4;
-                }
-
-                *(unsigned int*)(op) = *(const unsigned int*)(ip);
-                op += 4; ip += 4;
-                if (--t > 0)
-                {
-                    if (t >= 4)
-                    {
-                        do {
-                            *(unsigned int*)(op) = *(const unsigned int*)(ip);
-                            op += 4; ip += 4; t -= 4;
-                        } while (t >= 4);
-                        if (t > 0) do *op++ = *ip++; while (--t > 0);
-                    }
-                    else {
-                        do *op++ = *ip++; while (--t > 0);
-                    }
-                }
-            }
-            else {
-                needs_first_literal_run = false;
-            }
-
-            t = *ip++;
-            if (t < 16) {
-                m_pos = op - (1 + 0x0800);
-                m_pos -= t >> 2;
-                m_pos -= *ip++ << 2;
-                if (m_pos < out || m_pos >= op) {
-                    *out_len = op - out;
-                    return -6;
-                }
-                if ((unsigned long)(op_end - op) < (unsigned long)(3)) {
-                    *out_len = op - out;
-                    return -5;
-                }
-                *op++ = *m_pos++; *op++ = *m_pos++; *op++ = *m_pos;
-                needs_match_done = true;
-            }
-        }
-        else {
-            needs_match = false;
-        }
-
-        do {
-            if (needs_match_done == false) {
-                if (t >= 64)
-                {
-                    m_pos = op - 1;
-                    m_pos -= (t >> 2) & 7;
-                    m_pos -= *ip++ << 3;
-                    t = (t >> 5) - 1;
-
-                    if (m_pos < out || m_pos >= op) {
-                        *out_len = op - out;
-                        return -6;
-                    }
-                    if ((unsigned long)(op_end - op) < (unsigned long)(t + 3 - 1)) {
-                        *out_len = op - out;
-                        return -5;
-                    }
-                    goto copy_match;
-                }
-                else if (t >= 32)
-                {
-                    t &= 31;
-                    if (t == 0)
-                    {
-                        if ((unsigned long)(ip_end - ip) < (unsigned long)(1)) {
-                            *out_len = op - out;
-                            return -4;
-                        }
-                        while (*ip == 0)
-                        {
-                            t += 255;
-                            ip++;
-                            if ((unsigned long)(ip_end - ip) < (unsigned long)(1)) {
-                                *out_len = op - out;
-                                return -4;
-                            }
-                        }
-                        t += 31 + *ip++;
-                    }
-                    ip += 2;
-                }
-                else if (t >= 16)
-                {
-                    m_pos = op;
-                    m_pos -= (t & 8) << 11;
-                    t &= 7;
-                    if (t == 0)
-                    {
-                        if ((unsigned long)(ip_end - ip) < (unsigned long)(1)) {
-                            *out_len = op - out;
-                            return -4;
-                        }
-                        while (*ip == 0)
-                        {
-                            t += 255;
-                            ip++;
-                            if ((unsigned long)(ip_end - ip) < (unsigned long)(1)) {
-                                *out_len = op - out;
-                                return -4;
-                            }
-                        }
-                        t += 7 + *ip++;
-                    }
-
-                    m_pos -= (*(const unsigned short*)ip) >> 2;
-
-                    ip += 2;
-                    if (m_pos == op) {
-                        *out_len = op - out;
-                        return (ip == ip_end ? 0 :
-                            (ip < ip_end ? -8 : -4));
-                    }
-                    m_pos -= 0x4000;
-                }
-                else
-                {
-                    m_pos = op - 1;
-                    m_pos -= t >> 2;
-                    m_pos -= *ip++ << 2;
-
-                    if (m_pos < out || m_pos >= op) {
-                        *out_len = op - out;
-                        return -6;
-                    }
-                    if ((unsigned long)(op_end - op) < (unsigned long)(2)) {
-                        *out_len = op - out;
-                        return -5;
-                    }
-                    *op++ = *m_pos++; *op++ = *m_pos;
-
-                    needs_match_done = true;
-                }
-
-                if (needs_match_done == false) {
-                    if (m_pos < out || m_pos >= op) {
-                        *out_len = op - out;
-                        return -6;
-                    }
-                    if ((unsigned long)(op_end - op) < (unsigned long)(t + 3 - 1)) {
-                        *out_len = op - out;
-                        return -5;
-                    }
-
-                    if (t >= 2 * 4 - (3 - 1) && (op - m_pos) >= 4)
-                    {
-                        *(unsigned int*)(op) = *(const unsigned int*)(m_pos);
-                        op += 4; m_pos += 4; t -= 4 - (3 - 1);
-                        do {
-                            *(unsigned int*)(op) = *(const unsigned int*)(m_pos);
-                            op += 4; m_pos += 4; t -= 4;
-                        } while (t >= 4);
-                        if (t > 0) do *op++ = *m_pos++; while (--t > 0);
-                    }
-                    else
-                    {
-                    copy_match:
-                        *op++ = *m_pos++; *op++ = *m_pos++;
-                        do *op++ = *m_pos++; while (--t > 0);
-                    }
-                }
-                else {
-                    needs_match_done = false;
-                }
-            }
-            else {
-                needs_match_done = false;
-            }
-
-            t = ip[-2] & 3;
-
-            if (t == 0) {
-                break;
-            }
-
-            if ((unsigned long)(op_end - op) < (unsigned long)(t)) {
-                *out_len = op - out;
-                return -5;
-            }
-
-            if ((unsigned long)(ip_end - ip) < (unsigned long)(t + 1)) {
-                *out_len = op - out;
-                return -4;
-            }
-
-            *op++ = *ip++;
-
-            if (t > 1) {
-                *op++ = *ip++;
-                if (t > 2) {
-                    *op++ = *ip++;
-                }
-            }
-
-            t = *ip++;
-
-            if (ip >= ip_end) {
-                *out_len = op - out;
-                return -7;
-            }
-        } while (ip < ip_end);
-    }
-
-    *out_len = op - out;
-    return -7;
-}"""
+            return out_buffer[0:bytes_written.value]
+        except Exception as e:
+            error(e)
+            return False
